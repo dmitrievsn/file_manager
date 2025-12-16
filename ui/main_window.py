@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.clipboard import Clipboard
-from core.ops import copy_any, move_any, remove_any, create_file
+from core.ops import copy_any, move_any, remove_any, create_file, unique_path, merge_copy_dir
 from ui.properties_dialog import PropertiesDialog
 from ui.search_dialog import SearchDialog
 
@@ -325,11 +325,13 @@ class FileManagerWindow(QMainWindow):
             return
 
         file_path = self.current_dir() / name.strip()
+
+        # авто-нумерация если уже есть
         if file_path.exists():
-            self.show_error("Файл с таким именем уже существует.")
-            return
+            file_path = unique_path(file_path)
 
         try:
+            logger.info("CREATE_FILE | %s", file_path)
             create_file(file_path)
             self.refresh()
         except Exception as e:
@@ -344,40 +346,43 @@ class FileManagerWindow(QMainWindow):
         dst = dst_dir / src.name
 
         try:
-            if src.resolve() == dst.resolve():
-                self.show_error("Источник и назначение совпадают.")
-                return
-        except Exception:
-            pass
+            # ПАПКА
+            if src.is_dir():
+                if dst.exists() and dst.is_dir():
+                    if not self.confirm_merge_dirs(dst.name):
+                        return
 
-        if dst.exists():
-            res = QMessageBox.question(
-                self,
-                "Перезаписать?",
-                f"'{dst.name}' уже существует. Перезаписать?",
-                QMessageBox.Yes | QMessageBox.No,
-            )
-            if res != QMessageBox.Yes:
-                return
-            try:
-                remove_any(dst)
-            except Exception as e:
-                self.show_error(f"Не удалось удалить существующий объект: {e}")
-                return
+                    logger.info("MERGE_DIR | %s -> %s", src, dst)
+                    merge_copy_dir(src, dst)
 
-        try:
-            if self.clipboard.is_cut:
-                move_any(src, dst)
-                self.clipboard = Clipboard()
+                    if self.clipboard.is_cut:
+                        remove_any(src)
+                        self.clipboard = Clipboard()
+                else:
+                    # папки нет — обычная операция
+                    if self.clipboard.is_cut:
+                        move_any(src, dst)
+                        self.clipboard = Clipboard()
+                    else:
+                        copy_any(src, dst)
+
+            # ФАЙЛ
             else:
-                copy_any(src, dst)
+                # конфликт файла: keep both => авто-нумерация
+                final_dst = dst if not dst.exists() else unique_path(dst)
+
+                if self.clipboard.is_cut:
+                    move_any(src, final_dst)
+                    self.clipboard = Clipboard()
+                else:
+                    copy_any(src, final_dst)
+
         except Exception as e:
             self.show_error(f"Ошибка вставки: {e}")
             return
 
         self.refresh()
         self.status.showMessage("Готово.", 1500)
-
     # ===== Rename/Delete/Create =====
 
     def rename_item(self, path: Path):
@@ -424,10 +429,12 @@ class FileManagerWindow(QMainWindow):
         name, ok = QInputDialog.getText(self, "Создать папку", "Имя папки:", text="NewFolder")
         if not ok or not name.strip():
             return
+
         folder = self.current_dir() / name.strip()
+        # авто-нумерация если уже есть
         if folder.exists():
-            self.show_error("Такая папка уже существует.")
-            return
+            folder = unique_path(folder)
+
         try:
             logger.info("MKDIR | %s", folder)
             folder.mkdir(parents=False)
@@ -435,7 +442,6 @@ class FileManagerWindow(QMainWindow):
         except Exception as e:
             self.show_error(f"Ошибка создания папки: {e}")
 
-    # ===== Properties =====
 
     def show_properties(self, path: Path):
         dlg = PropertiesDialog(path, self)
@@ -485,3 +491,40 @@ class FileManagerWindow(QMainWindow):
     def show_error(self, message: str):
         logger.error("ERROR | %s", message)
         QMessageBox.critical(self, "Ошибка", message)
+
+    def confirm_merge_dirs(self, folder_name: str) -> bool:
+        """
+        Диалог подтверждения слияния папок.
+        Возвращает True, если пользователь согласился.
+        """
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Warning)
+        msg.setWindowTitle("Слияние папок")
+        msg.setText(
+            f'В целевой папке уже существует каталог "{folder_name}".\n\n'
+            "При нажатии «OK» содержимое папок будет объединено.\n"
+            "Файлы с одинаковыми именами будут сохранены в обоих вариантах "
+            "с автоматическим добавлением номера.\n\n"
+            "Продолжить?"
+        )
+
+        btn_ok = msg.addButton("OK", QMessageBox.AcceptRole)
+        btn_cancel = msg.addButton("Отмена", QMessageBox.RejectRole)
+        btn_help = msg.addButton("Справка", QMessageBox.HelpRole)
+
+        msg.exec()
+
+        if msg.clickedButton() == btn_help:
+            QMessageBox.information(
+                self,
+                "Справка",
+                "Слияние папок объединяет содержимое каталогов.\n\n"
+                "• Существующие файлы не удаляются\n"
+                "• При совпадении имён создаётся копия с номером\n"
+                "• Операция необратима",
+            )
+            # после справки снова спрашиваем
+            return self.confirm_merge_dirs(folder_name)
+
+        return msg.clickedButton() == btn_ok
+
