@@ -1,8 +1,11 @@
+from __future__ import annotations
+
+import logging
 from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import QDir, Qt, QModelIndex, QUrl
-from PySide6.QtGui import QAction, QDesktopServices
+from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
     QFileSystemModel,
     QHBoxLayout,
@@ -12,6 +15,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QSplitter,
     QStatusBar,
     QToolBar,
     QTreeView,
@@ -20,40 +24,57 @@ from PySide6.QtWidgets import (
 )
 
 from core.clipboard import Clipboard
-from core.ops import copy_any, move_any, remove_any
+from core.ops import copy_any, move_any, remove_any, create_file
+from ui.properties_dialog import PropertiesDialog
+from ui.search_dialog import SearchDialog
+
+logger = logging.getLogger(__name__)
 
 
 class FileManagerWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Файловый менеджер (Python / PySide6)")
-        self.resize(1100, 650)
+        self.setWindowTitle("Файловый менеджер")
+        self.resize(1200, 700)
 
         self.clipboard = Clipboard()
         self.history: list[Path] = []
         self.history_index = -1
 
-        # --- Model ---
-        self.model = QFileSystemModel()
-        self.model.setRootPath(QDir.rootPath())
-        self.model.setFilter(QDir.AllEntries | QDir.NoDotAndDotDot)
+        # ===== Models =====
+        self.dir_model = QFileSystemModel()
+        self.dir_model.setRootPath(QDir.rootPath())
+        self.dir_model.setFilter(QDir.Dirs | QDir.NoDotAndDotDot)
 
-        # --- View ---
-        self.tree = QTreeView()
-        self.tree.setModel(self.model)
-        self.tree.setSortingEnabled(True)
-        self.tree.sortByColumn(0, Qt.AscendingOrder)
-        self.tree.doubleClicked.connect(self.on_double_click)
-        self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.tree.customContextMenuRequested.connect(self.open_context_menu)
+        self.file_model = QFileSystemModel()
+        self.file_model.setRootPath(QDir.rootPath())
+        self.file_model.setFilter(QDir.AllEntries | QDir.NoDotAndDotDot)
 
-        # columns: 0 name, 1 size, 2 type, 3 modified
-        self.tree.setColumnWidth(0, 420)
-        self.tree.setColumnWidth(1, 120)
-        self.tree.setColumnWidth(2, 180)
-        self.tree.setColumnWidth(3, 180)
+        # ===== Views =====
+        self.dir_tree = QTreeView()
+        self.dir_tree.setModel(self.dir_model)
+        self.dir_tree.setHeaderHidden(False)
+        self.dir_tree.setColumnWidth(0, 260)
+        self.dir_tree.clicked.connect(self.on_dir_clicked)
 
-        # --- Top bar ---
+        # Спрячем лишние колонки у дерева папок
+        for col in [1, 2, 3]:
+            self.dir_tree.setColumnHidden(col, True)
+
+        self.file_view = QTreeView()
+        self.file_view.setModel(self.file_model)
+        self.file_view.setSortingEnabled(True)
+        self.file_view.sortByColumn(0, Qt.AscendingOrder)
+        self.file_view.doubleClicked.connect(self.on_file_double_click)
+        self.file_view.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.file_view.customContextMenuRequested.connect(self.open_context_menu)
+
+        self.file_view.setColumnWidth(0, 480)
+        self.file_view.setColumnWidth(1, 120)
+        self.file_view.setColumnWidth(2, 200)
+        self.file_view.setColumnWidth(3, 180)
+
+        # ===== Top bar =====
         self.path_edit = QLineEdit()
         self.path_edit.returnPressed.connect(self.go_to_path)
 
@@ -73,14 +94,21 @@ class FileManagerWindow(QMainWindow):
         top_layout.addWidget(self.btn_up)
         top_layout.addWidget(self.path_edit, 1)
 
+        # ===== Splitter (two-panel) =====
+        splitter = QSplitter()
+        splitter.addWidget(self.dir_tree)
+        splitter.addWidget(self.file_view)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+
         central = QWidget()
         layout = QVBoxLayout(central)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(top)
-        layout.addWidget(self.tree, 1)
+        layout.addWidget(splitter, 1)
         self.setCentralWidget(central)
 
-        # --- Toolbar ---
+        # ===== Toolbar =====
         tb = QToolBar("Main")
         self.addToolBar(tb)
 
@@ -88,13 +116,60 @@ class FileManagerWindow(QMainWindow):
         act_refresh.triggered.connect(self.refresh)
         tb.addAction(act_refresh)
 
-        # --- Status bar ---
+        act_search = QAction("Поиск", self)
+        act_search.setShortcut(QKeySequence("Ctrl+F"))
+        act_search.triggered.connect(self.open_search)
+        tb.addAction(act_search)
+
+        # ===== Hotkeys via Actions =====
+        self._setup_hotkeys()
+
+        # ===== Status bar =====
         self.status = QStatusBar()
         self.setStatusBar(self.status)
 
         # start dir
         self.set_current_dir(Path.home())
-        self.tree.selectionModel().selectionChanged.connect(self.update_status)
+        self.file_view.selectionModel().selectionChanged.connect(self.update_status)
+
+    # ===================== Hotkeys =====================
+
+    def _setup_hotkeys(self):
+        # Copy
+        a_copy = QAction(self)
+        a_copy.setShortcut(QKeySequence.Copy)
+        a_copy.triggered.connect(self.copy_selected)
+        self.addAction(a_copy)
+
+        # Cut
+        a_cut = QAction(self)
+        a_cut.setShortcut(QKeySequence.Cut)
+        a_cut.triggered.connect(self.cut_selected)
+        self.addAction(a_cut)
+
+        # Paste
+        a_paste = QAction(self)
+        a_paste.setShortcut(QKeySequence.Paste)
+        a_paste.triggered.connect(self.paste_item)
+        self.addAction(a_paste)
+
+        # Delete
+        a_del = QAction(self)
+        a_del.setShortcut(QKeySequence.Delete)
+        a_del.triggered.connect(self.delete_selected)
+        self.addAction(a_del)
+
+        # Rename (F2)
+        a_rename = QAction(self)
+        a_rename.setShortcut(QKeySequence(Qt.Key_F2))
+        a_rename.triggered.connect(self.rename_selected)
+        self.addAction(a_rename)
+
+        # Properties (Alt+Enter)
+        a_props = QAction(self)
+        a_props.setShortcut(QKeySequence("Alt+Return"))
+        a_props.triggered.connect(self.show_properties_selected)
+        self.addAction(a_props)
 
     # ===================== Navigation =====================
 
@@ -111,11 +186,21 @@ class FileManagerWindow(QMainWindow):
             self.history_index += 1
 
         self.path_edit.setText(str(path))
-        root_index = self.model.index(str(path))
+
+        # right panel root
+        root_index = self.file_model.index(str(path))
         if root_index.isValid():
-            self.tree.setRootIndex(root_index)
-            self.update_nav_buttons()
-            self.update_status()
+            self.file_view.setRootIndex(root_index)
+
+        # left panel highlight
+        d_idx = self.dir_model.index(str(path))
+        if d_idx.isValid():
+            self.dir_tree.setCurrentIndex(d_idx)
+            self.dir_tree.scrollTo(d_idx)
+
+        self.update_nav_buttons()
+        self.update_status()
+        logger.info("CD | %s", path)
 
     def current_dir(self) -> Path:
         return Path(self.path_edit.text()).expanduser().resolve()
@@ -131,13 +216,11 @@ class FileManagerWindow(QMainWindow):
         if self.history_index > 0:
             self.history_index -= 1
             self.set_current_dir(self.history[self.history_index], push_history=False)
-            self.update_nav_buttons()
 
     def go_forward(self):
         if self.history_index < len(self.history) - 1:
             self.history_index += 1
             self.set_current_dir(self.history[self.history_index], push_history=False)
-            self.update_nav_buttons()
 
     def go_up(self):
         d = self.current_dir()
@@ -148,58 +231,60 @@ class FileManagerWindow(QMainWindow):
     def refresh(self):
         self.set_current_dir(self.current_dir(), push_history=False)
 
-    # ===================== UI actions =====================
+    # ===================== Left panel =====================
 
-    def on_double_click(self, index: QModelIndex):
-        path = Path(self.model.filePath(index))
+    def on_dir_clicked(self, index: QModelIndex):
+        path = Path(self.dir_model.filePath(index))
+        if path.exists() and path.is_dir():
+            self.set_current_dir(path)
+
+    # ===================== Right panel actions =====================
+
+    def selected_path(self) -> Optional[Path]:
+        idx = self.file_view.currentIndex()
+        if not idx.isValid():
+            return None
+        return Path(self.file_model.filePath(idx))
+
+    def on_file_double_click(self, index: QModelIndex):
+        path = Path(self.file_model.filePath(index))
         if path.is_dir():
             self.set_current_dir(path)
         else:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
     def open_context_menu(self, pos):
-        index = self.tree.indexAt(pos)
+        index = self.file_view.indexAt(pos)
         menu = QMenu(self)
 
         target_path: Optional[Path] = None
         if index.isValid():
-            target_path = Path(self.model.filePath(index))
+            target_path = Path(self.file_model.filePath(index))
 
         if target_path:
-            act_open = QAction("Открыть", self)
-            act_open.triggered.connect(lambda: self.open_item(target_path))
-            menu.addAction(act_open)
-
+            menu.addAction(self._mk_action("Открыть", lambda: self.open_item(target_path)))
             menu.addSeparator()
-
-            act_copy = QAction("Копировать", self)
-            act_copy.triggered.connect(lambda: self.copy_item(target_path))
-            menu.addAction(act_copy)
-
-            act_cut = QAction("Вырезать", self)
-            act_cut.triggered.connect(lambda: self.cut_item(target_path))
-            menu.addAction(act_cut)
-
-            act_rename = QAction("Переименовать", self)
-            act_rename.triggered.connect(lambda: self.rename_item(target_path))
-            menu.addAction(act_rename)
-
-            act_delete = QAction("Удалить", self)
-            act_delete.triggered.connect(lambda: self.delete_item(target_path))
-            menu.addAction(act_delete)
-
+            menu.addAction(self._mk_action("Копировать", lambda: self.copy_item(target_path)))
+            menu.addAction(self._mk_action("Вырезать", lambda: self.cut_item(target_path)))
+            menu.addAction(self._mk_action("Вставить", self.paste_item, enabled=self.clipboard.src is not None))
             menu.addSeparator()
+            menu.addAction(self._mk_action("Переименовать", lambda: self.rename_item(target_path)))
+            menu.addAction(self._mk_action("Удалить", lambda: self.delete_item(target_path)))
+            menu.addSeparator()
+            menu.addAction(self._mk_action("Свойства", lambda: self.show_properties(target_path)))
+        else:
+            menu.addAction(self._mk_action("Вставить", self.paste_item, enabled=self.clipboard.src is not None))
 
-        act_paste = QAction("Вставить", self)
-        act_paste.setEnabled(self.clipboard.src is not None)
-        act_paste.triggered.connect(self.paste_item)
-        menu.addAction(act_paste)
+        menu.addSeparator()
+        menu.addAction(self._mk_action("Создать папку", self.create_folder))
+        menu.addAction(self._mk_action("Создать файл", self.create_file))
+        menu.exec(self.file_view.viewport().mapToGlobal(pos))
 
-        act_new_folder = QAction("Создать папку", self)
-        act_new_folder.triggered.connect(self.create_folder)
-        menu.addAction(act_new_folder)
-
-        menu.exec(self.tree.viewport().mapToGlobal(pos))
+    def _mk_action(self, text, fn, enabled=True):
+        a = QAction(text, self)
+        a.setEnabled(enabled)
+        a.triggered.connect(fn)
+        return a
 
     def open_item(self, path: Path):
         if path.is_dir():
@@ -207,13 +292,48 @@ class FileManagerWindow(QMainWindow):
         else:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
+    # ===== Clipboard operations =====
+
     def copy_item(self, path: Path):
         self.clipboard = Clipboard(src=path, is_cut=False)
-        self.status.showMessage(f"Буфер: копировать {path.name}", 2500)
+        self.status.showMessage(f"Буфер: копировать {path.name}", 2000)
+        logger.info("CLIPBOARD | COPY | %s", path)
 
     def cut_item(self, path: Path):
         self.clipboard = Clipboard(src=path, is_cut=True)
-        self.status.showMessage(f"Буфер: переместить {path.name}", 2500)
+        self.status.showMessage(f"Буфер: переместить {path.name}", 2000)
+        logger.info("CLIPBOARD | CUT | %s", path)
+
+    def copy_selected(self):
+        p = self.selected_path()
+        if p:
+            self.copy_item(p)
+
+    def cut_selected(self):
+        p = self.selected_path()
+        if p:
+            self.cut_item(p)
+
+    def create_file(self):
+        name, ok = QInputDialog.getText(
+            self,
+            "Создать файл",
+            "Имя файла (например test.txt):",
+            text="new_file.txt",
+        )
+        if not ok or not name.strip():
+            return
+
+        file_path = self.current_dir() / name.strip()
+        if file_path.exists():
+            self.show_error("Файл с таким именем уже существует.")
+            return
+
+        try:
+            create_file(file_path)
+            self.refresh()
+        except Exception as e:
+            self.show_error(f"Ошибка создания файла: {e}")
 
     def paste_item(self):
         if not self.clipboard.src:
@@ -248,7 +368,7 @@ class FileManagerWindow(QMainWindow):
         try:
             if self.clipboard.is_cut:
                 move_any(src, dst)
-                self.clipboard = Clipboard()  # clear after move
+                self.clipboard = Clipboard()
             else:
                 copy_any(src, dst)
         except Exception as e:
@@ -256,7 +376,9 @@ class FileManagerWindow(QMainWindow):
             return
 
         self.refresh()
-        self.status.showMessage("Готово.", 2000)
+        self.status.showMessage("Готово.", 1500)
+
+    # ===== Rename/Delete/Create =====
 
     def rename_item(self, path: Path):
         new_name, ok = QInputDialog.getText(self, "Переименовать", "Новое имя:", text=path.name)
@@ -267,10 +389,16 @@ class FileManagerWindow(QMainWindow):
             self.show_error("Файл/папка с таким именем уже существует.")
             return
         try:
+            logger.info("RENAME | %s -> %s", path, new_path)
             path.rename(new_path)
             self.refresh()
         except Exception as e:
             self.show_error(f"Ошибка переименования: {e}")
+
+    def rename_selected(self):
+        p = self.selected_path()
+        if p:
+            self.rename_item(p)
 
     def delete_item(self, path: Path):
         res = QMessageBox.question(
@@ -287,6 +415,11 @@ class FileManagerWindow(QMainWindow):
         except Exception as e:
             self.show_error(f"Ошибка удаления: {e}")
 
+    def delete_selected(self):
+        p = self.selected_path()
+        if p:
+            self.delete_item(p)
+
     def create_folder(self):
         name, ok = QInputDialog.getText(self, "Создать папку", "Имя папки:", text="NewFolder")
         if not ok or not name.strip():
@@ -296,30 +429,59 @@ class FileManagerWindow(QMainWindow):
             self.show_error("Такая папка уже существует.")
             return
         try:
+            logger.info("MKDIR | %s", folder)
             folder.mkdir(parents=False)
             self.refresh()
         except Exception as e:
             self.show_error(f"Ошибка создания папки: {e}")
 
-    # ===================== Helpers =====================
+    # ===== Properties =====
+
+    def show_properties(self, path: Path):
+        dlg = PropertiesDialog(path, self)
+        dlg.exec()
+
+    def show_properties_selected(self):
+        p = self.selected_path()
+        if p:
+            self.show_properties(p)
+
+    # ===== Search =====
+
+    def open_search(self):
+        dlg = SearchDialog(self.current_dir(), self)
+        res = dlg.exec()
+        if res:  # accept
+            p = dlg.get_selected()
+            if p:
+                # если файл — перейдём в папку
+                target_dir = p if p.is_dir() else p.parent
+                self.set_current_dir(target_dir)
+
+    # ===================== Status =====================
 
     def update_status(self, *_):
-        index = self.tree.currentIndex()
-        if index.isValid():
-            p = Path(self.model.filePath(index))
-            if p.exists():
-                if p.is_dir():
-                    self.status.showMessage(f"Папка: {p.name}")
-                else:
-                    try:
-                        size = p.stat().st_size
-                        self.status.showMessage(f"Файл: {p.name} | {size} байт")
-                    except Exception:
-                        self.status.showMessage(f"Файл: {p.name}")
+        # статус текущей папки: количество объектов
+        try:
+            root = self.current_dir()
+            count = 0
+            for _ in root.iterdir():
+                count += 1
+            msg = f"{root} | объектов: {count}"
+        except Exception:
+            msg = str(self.current_dir())
+
+        sel = self.selected_path()
+        if sel and sel.exists():
+            if sel.is_file():
+                try:
+                    msg += f" | выделено: {sel.name} ({sel.stat().st_size} B)"
+                except Exception:
+                    msg += f" | выделено: {sel.name}"
             else:
-                self.status.clearMessage()
-        else:
-            self.status.showMessage(str(self.current_dir()))
+                msg += f" | выделено: {sel.name} (папка)"
+        self.status.showMessage(msg)
 
     def show_error(self, message: str):
+        logger.error("ERROR | %s", message)
         QMessageBox.critical(self, "Ошибка", message)
