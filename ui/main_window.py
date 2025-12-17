@@ -24,7 +24,16 @@ from PySide6.QtWidgets import (
 )
 
 from core.clipboard import Clipboard
-from core.ops import copy_any, move_any, remove_any, create_file, unique_path, merge_copy_dir
+from core.ops import (
+    copy_any,
+    move_any,
+    remove_any,
+    create_file,
+    merge_copy_dir,
+    unique_file_path,
+    unique_dir_path,
+)
+
 from ui.properties_dialog import PropertiesDialog
 from ui.search_dialog import SearchDialog
 
@@ -150,7 +159,7 @@ class FileManagerWindow(QMainWindow):
         # Paste
         a_paste = QAction(self)
         a_paste.setShortcut(QKeySequence.Paste)
-        a_paste.triggered.connect(self.paste_item)
+        a_paste.triggered.connect(lambda: self.paste_item(self.paste_target_dir()))
         self.addAction(a_paste)
 
         # Delete
@@ -172,6 +181,18 @@ class FileManagerWindow(QMainWindow):
         self.addAction(a_props)
 
     # ===================== Navigation =====================
+
+    def paste_target_dir(self) -> Path:
+        """
+        Вычисляет папку-назначение для Ctrl+V:
+        - если выделена папка -> вставляем в неё
+        - если выделен файл -> вставляем в его родителя
+        - если ничего не выделено -> вставляем в текущую папку
+        """
+        p = self.selected_path()
+        if p and p.exists():
+            return p if p.is_dir() else p.parent
+        return self.current_dir()
 
     def set_current_dir(self, path: Path, push_history: bool = True):
         path = path.expanduser().resolve()
@@ -266,14 +287,28 @@ class FileManagerWindow(QMainWindow):
             menu.addSeparator()
             menu.addAction(self._mk_action("Копировать", lambda: self.copy_item(target_path)))
             menu.addAction(self._mk_action("Вырезать", lambda: self.cut_item(target_path)))
-            menu.addAction(self._mk_action("Вставить", self.paste_item, enabled=self.clipboard.src is not None))
+            dst_dir = target_path if target_path.is_dir() else target_path.parent
+            menu.addAction(
+                self._mk_action(
+                    "Вставить",
+                    lambda: self.paste_item(dst_dir),
+                    enabled=self.clipboard.src is not None,
+                )
+            )
             menu.addSeparator()
             menu.addAction(self._mk_action("Переименовать", lambda: self.rename_item(target_path)))
             menu.addAction(self._mk_action("Удалить", lambda: self.delete_item(target_path)))
             menu.addSeparator()
             menu.addAction(self._mk_action("Свойства", lambda: self.show_properties(target_path)))
+
         else:
-            menu.addAction(self._mk_action("Вставить", self.paste_item, enabled=self.clipboard.src is not None))
+            menu.addAction(
+                self._mk_action(
+                    "Вставить",
+                    lambda: self.paste_item(self.current_dir()),
+                    enabled=self.clipboard.src is not None,
+                )
+            )
 
         menu.addSeparator()
         menu.addAction(self._mk_action("Создать папку", self.create_folder))
@@ -326,9 +361,9 @@ class FileManagerWindow(QMainWindow):
 
         file_path = self.current_dir() / name.strip()
 
-        # авто-нумерация если уже есть
+        # авто-нумерация именно для файла (важно: даже если существует папка с таким именем)
         if file_path.exists():
-            file_path = unique_path(file_path)
+            file_path = unique_file_path(file_path)
 
         try:
             logger.info("CREATE_FILE | %s", file_path)
@@ -337,45 +372,66 @@ class FileManagerWindow(QMainWindow):
         except Exception as e:
             self.show_error(f"Ошибка создания файла: {e}")
 
-    def paste_item(self):
+    def paste_item(self, dst_dir: Optional[Path] = None):
         if not self.clipboard.src:
             return
 
         src = self.clipboard.src
-        dst_dir = self.current_dir()
+        dst_dir = (dst_dir or self.current_dir()).expanduser().resolve()
         dst = dst_dir / src.name
 
         try:
-            # ПАПКА
             if src.is_dir():
-                if dst.exists() and dst.is_dir():
-                    if not self.confirm_merge_dirs(dst.name):
-                        return
+                # ===== Вставляем ПАПКУ =====
+                if dst.exists():
+                    if dst.is_dir():
+                        # merge папок
+                        if not self.confirm_merge_dirs(dst.name):
+                            return
 
-                    logger.info("MERGE_DIR | %s -> %s", src, dst)
-                    merge_copy_dir(src, dst)
+                        logger.info("MERGE_DIR | %s -> %s", src, dst)
+                        merge_copy_dir(src, dst)
 
-                    if self.clipboard.is_cut:
-                        remove_any(src)
-                        self.clipboard = Clipboard()
+                        if self.clipboard.is_cut:
+                            remove_any(src)
+                            self.clipboard = Clipboard()
+                    else:
+                        # конфликт: в месте папки уже есть ФАЙЛ => даём папке новое имя
+                        dst2 = unique_dir_path(dst)
+                        logger.info("DIR_CONFLICT_WITH_FILE | %s -> %s", src, dst2)
+
+                        if self.clipboard.is_cut:
+                            move_any(src, dst2)
+                            self.clipboard = Clipboard()
+                        else:
+                            copy_any(src, dst2)
                 else:
-                    # папки нет — обычная операция
+                    # dst свободен
                     if self.clipboard.is_cut:
                         move_any(src, dst)
                         self.clipboard = Clipboard()
                     else:
                         copy_any(src, dst)
 
-            # ФАЙЛ
             else:
-                # конфликт файла: keep both => авто-нумерация
-                final_dst = dst if not dst.exists() else unique_path(dst)
+                # ===== Вставляем ФАЙЛ =====
+                if dst.exists():
+                    if dst.is_dir():
+                        # конфликт: в месте файла уже есть ПАПКА => даём файлу новое имя
+                        dst2 = unique_file_path(dst)  # dst = ".../new_file.txt" (папка), получим ".../new_file (1).txt"
+                        logger.info("FILE_CONFLICT_WITH_DIR | %s -> %s", src, dst2)
+                    else:
+                        # конфликт: файл-файл => keep both
+                        dst2 = unique_file_path(dst)
+                        logger.info("FILE_CONFLICT_WITH_FILE | %s -> %s", src, dst2)
+                else:
+                    dst2 = dst
 
                 if self.clipboard.is_cut:
-                    move_any(src, final_dst)
+                    move_any(src, dst2)
                     self.clipboard = Clipboard()
                 else:
-                    copy_any(src, final_dst)
+                    copy_any(src, dst2)
 
         except Exception as e:
             self.show_error(f"Ошибка вставки: {e}")
@@ -383,6 +439,7 @@ class FileManagerWindow(QMainWindow):
 
         self.refresh()
         self.status.showMessage("Готово.", 1500)
+
     # ===== Rename/Delete/Create =====
 
     def rename_item(self, path: Path):
@@ -431,9 +488,10 @@ class FileManagerWindow(QMainWindow):
             return
 
         folder = self.current_dir() / name.strip()
-        # авто-нумерация если уже есть
+
+        # авто-нумерация именно для папки
         if folder.exists():
-            folder = unique_path(folder)
+            folder = unique_dir_path(folder)
 
         try:
             logger.info("MKDIR | %s", folder)
@@ -441,7 +499,6 @@ class FileManagerWindow(QMainWindow):
             self.refresh()
         except Exception as e:
             self.show_error(f"Ошибка создания папки: {e}")
-
 
     def show_properties(self, path: Path):
         dlg = PropertiesDialog(path, self)

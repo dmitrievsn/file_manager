@@ -74,19 +74,69 @@ def unique_path(path: Path) -> Path:
 
 def merge_copy_dir(src_dir: Path, dst_dir: Path) -> None:
     """
-    Слить содержимое src_dir в dst_dir.
-    Если файлы конфликтуют — новый файл сохраняется под уникальным именем.
+    Слияние каталогов: копирует содержимое ИЗ src_dir В dst_dir.
+
+    Правила:
+    - Папки объединяются рекурсивно.
+    - Файлы с одинаковыми именами сохраняются оба: добавляется номер (keep both).
+    - В src_dir ничего не создаётся и не изменяется.
     """
-    dst_dir.mkdir(exist_ok=True)
+    src_dir = src_dir.expanduser().resolve()
+    dst_dir = dst_dir.expanduser().resolve()
 
-    for item in src_dir.iterdir():
-        dst_item = dst_dir / item.name
+    if not src_dir.exists() or not src_dir.is_dir():
+        raise ValueError(f"merge_copy_dir: src_dir is not a directory: {src_dir}")
 
-        if item.is_dir():
-            # если папка уже есть — продолжаем merge внутрь неё
-            merge_copy_dir(item, dst_item)
+    # создаём dst_dir при необходимости
+    dst_dir.mkdir(parents=True, exist_ok=True)
+
+    for src_item in src_dir.iterdir():
+        dst_item = dst_dir / src_item.name
+
+        if src_item.is_dir():
+            # если в назначении файл с таким именем — создаём новую папку с номером
+            if dst_item.exists() and dst_item.is_file():
+                dst_item = unique_dir_path(dst_item)
+
+            # рекурсивный merge
+            merge_copy_dir(src_item, dst_item)
+
         else:
-            # конфликт файла — сохраняем "оба" через unique_path
-            final_dst = dst_item if not dst_item.exists() else unique_path(dst_item)
-            logger.info("MERGE_COPY_FILE | %s -> %s", item, final_dst)
-            shutil.copy2(str(item), str(final_dst))
+            # src_item — файл
+            if dst_item.exists():
+                # если в назначении папка с таким именем или файл — keep both
+                dst_item = unique_file_path(dst_item)
+
+            shutil.copy2(src_item, dst_item)
+
+
+def unique_file_path(dst: Path) -> Path:
+    """
+    Уникальное имя именно ДЛЯ ФАЙЛА (с сохранением расширения),
+    даже если dst уже существует и является папкой.
+    """
+    parent = dst.parent
+    stem = dst.stem
+    suffix = dst.suffix  # '.txt'
+
+    i = 1
+    while True:
+        cand = parent / f"{stem} ({i}){suffix}"
+        if not cand.exists():
+            return cand
+        i += 1
+
+
+def unique_dir_path(dst: Path) -> Path:
+    """
+    Уникальное имя именно ДЛЯ ПАПКИ, даже если в имени есть точки.
+    """
+    parent = dst.parent
+    base = dst.name
+
+    i = 1
+    while True:
+        cand = parent / f"{base} ({i})"
+        if not cand.exists():
+            return cand
+        i += 1
