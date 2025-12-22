@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
-from PySide6.QtCore import QDir, Qt, QModelIndex, QUrl
+from PySide6.QtCore import QDir, Qt, QModelIndex, QUrl, QEvent
 from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
     QFileSystemModel,
@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QTreeView,
     QVBoxLayout,
     QWidget,
+    QAbstractItemView
 )
 
 from core.clipboard import Clipboard
@@ -28,328 +29,398 @@ from core.ops import (
     copy_any,
     move_any,
     remove_any,
-    create_file,
+    create_file as core_create_file,
     merge_copy_dir,
     unique_file_path,
     unique_dir_path,
 )
-
 from ui.properties_dialog import PropertiesDialog
 from ui.search_dialog import SearchDialog
+from ui.compare_dialog import CompareDialog
+from ui.batch_rename_dialog import BatchRenameDialog
+from ui.attrs_dialog import AttrsDialog
+from core.attrs import apply_attrs
+from core.locks import is_locked
+
 
 logger = logging.getLogger(__name__)
+
+
+class FilePanel:
+    def __init__(self):
+        self.model = QFileSystemModel()
+        self.model.setRootPath(QDir.rootPath())
+        self.model.setFilter(QDir.AllEntries | QDir.NoDotAndDotDot)
+
+        self.view = QTreeView()
+        self.view.setModel(self.model)
+        self.view.setSelectionMode(QAbstractItemView.ExtendedSelection)  # Ctrl/Shift мультивыбор
+        self.view.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.view.setSortingEnabled(True)
+        self.view.sortByColumn(0, Qt.AscendingOrder)
+        self.view.setColumnWidth(0, 380)
+
+        self.path_edit = QLineEdit()
+        self.root: Path = Path.home()
+
+        # история как в проводнике
+        self.history: list[Path] = []
+        self.history_index: int = -1
+
+        # кнопки навигации
+        self.btn_back = QPushButton("←")
+        self.btn_forward = QPushButton("→")
+        self.btn_up = QPushButton("↑")
 
 
 class FileManagerWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Файловый менеджер")
-        self.resize(1200, 700)
+        self.setWindowTitle("Файловый менеджер (двухпанельный)")
+        self.resize(1400, 750)
 
         self.clipboard = Clipboard()
-        self.history: list[Path] = []
-        self.history_index = -1
+        self.active: str = "L"  # "L" or "R"
 
-        # ===== Models =====
-        self.dir_model = QFileSystemModel()
-        self.dir_model.setRootPath(QDir.rootPath())
-        self.dir_model.setFilter(QDir.Dirs | QDir.NoDotAndDotDot)
+        # ===== Panels =====
+        self.left = FilePanel()
+        self.right = FilePanel()
 
-        self.file_model = QFileSystemModel()
-        self.file_model.setRootPath(QDir.rootPath())
-        self.file_model.setFilter(QDir.AllEntries | QDir.NoDotAndDotDot)
+        # Важно: активность панели должна определяться и кликом, и фокусом (клавиатура!)
+        self.left.view.clicked.connect(lambda _: self.set_active("L"))
+        self.right.view.clicked.connect(lambda _: self.set_active("R"))
+        self.left.view.installEventFilter(self)
+        self.right.view.installEventFilter(self)
 
-        # ===== Views =====
-        self.dir_tree = QTreeView()
-        self.dir_tree.setModel(self.dir_model)
-        self.dir_tree.setHeaderHidden(False)
-        self.dir_tree.setColumnWidth(0, 260)
-        self.dir_tree.clicked.connect(self.on_dir_clicked)
+        self.left.view.doubleClicked.connect(lambda idx: self.on_double_click(self.left, idx))
+        self.right.view.doubleClicked.connect(lambda idx: self.on_double_click(self.right, idx))
 
-        # Спрячем лишние колонки у дерева папок
-        for col in [1, 2, 3]:
-            self.dir_tree.setColumnHidden(col, True)
+        self.left.view.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.right.view.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.left.view.customContextMenuRequested.connect(lambda pos: self.open_context_menu(self.left, pos))
+        self.right.view.customContextMenuRequested.connect(lambda pos: self.open_context_menu(self.right, pos))
 
-        self.file_view = QTreeView()
-        self.file_view.setModel(self.file_model)
-        self.file_view.setSortingEnabled(True)
-        self.file_view.sortByColumn(0, Qt.AscendingOrder)
-        self.file_view.doubleClicked.connect(self.on_file_double_click)
-        self.file_view.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.file_view.customContextMenuRequested.connect(self.open_context_menu)
+        # ===== Top bar (две панели со стрелками) =====
+        def _wire_panel_nav(panel: FilePanel, which: str):
+            panel.btn_back.clicked.connect(lambda: self.go_back(panel))
+            panel.btn_forward.clicked.connect(lambda: self.go_forward(panel))
+            panel.btn_up.clicked.connect(lambda: self.go_up(panel))
+            panel.path_edit.returnPressed.connect(lambda: self.go_to_path(panel))
 
-        self.file_view.setColumnWidth(0, 480)
-        self.file_view.setColumnWidth(1, 120)
-        self.file_view.setColumnWidth(2, 200)
-        self.file_view.setColumnWidth(3, 180)
+            # клики по кнопкам/полю тоже делают панель активной
+            panel.btn_back.clicked.connect(lambda: self.set_active(which))
+            panel.btn_forward.clicked.connect(lambda: self.set_active(which))
+            panel.btn_up.clicked.connect(lambda: self.set_active(which))
+            panel.path_edit.focusInEvent = lambda e, w=which, old=panel.path_edit.focusInEvent: (self.set_active(w),
+                                                                                                 old(e))
 
-        # ===== Top bar =====
-        self.path_edit = QLineEdit()
-        self.path_edit.returnPressed.connect(self.go_to_path)
-
-        self.btn_back = QPushButton("←")
-        self.btn_forward = QPushButton("→")
-        self.btn_up = QPushButton("↑")
-
-        self.btn_back.clicked.connect(self.go_back)
-        self.btn_forward.clicked.connect(self.go_forward)
-        self.btn_up.clicked.connect(self.go_up)
+        _wire_panel_nav(self.left, "L")
+        _wire_panel_nav(self.right, "R")
 
         top = QWidget()
-        top_layout = QHBoxLayout(top)
-        top_layout.setContentsMargins(8, 8, 8, 8)
-        top_layout.addWidget(self.btn_back)
-        top_layout.addWidget(self.btn_forward)
-        top_layout.addWidget(self.btn_up)
-        top_layout.addWidget(self.path_edit, 1)
+        top_l = QHBoxLayout(top)
+        top_l.setContentsMargins(8, 8, 8, 8)
+        top_l.setSpacing(6)
 
-        # ===== Splitter (two-panel) =====
-        splitter = QSplitter()
-        splitter.addWidget(self.dir_tree)
-        splitter.addWidget(self.file_view)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
+        # Левая панель: ← → ↑ [path]
+        top_l.addWidget(self.left.btn_back)
+        top_l.addWidget(self.left.btn_forward)
+        top_l.addWidget(self.left.btn_up)
+        top_l.addWidget(self.left.path_edit, 1)
+
+        # Правая панель: ← → ↑ [path]
+        top_l.addWidget(self.right.btn_back)
+        top_l.addWidget(self.right.btn_forward)
+        top_l.addWidget(self.right.btn_up)
+        top_l.addWidget(self.right.path_edit, 1)
+
+        # ===== Splitter =====
+        split = QSplitter()
+        split.addWidget(self.left.view)
+        split.addWidget(self.right.view)
+        split.setStretchFactor(0, 1)
+        split.setStretchFactor(1, 1)
 
         central = QWidget()
-        layout = QVBoxLayout(central)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(top)
-        layout.addWidget(splitter, 1)
+        lay = QVBoxLayout(central)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(top)
+        lay.addWidget(split, 1)
         self.setCentralWidget(central)
 
         # ===== Toolbar =====
         tb = QToolBar("Main")
         self.addToolBar(tb)
 
-        act_refresh = QAction("Обновить", self)
-        act_refresh.triggered.connect(self.refresh)
-        tb.addAction(act_refresh)
+        tb.addAction(self._act("Обновить", self.refresh_panels, "F5"))
+        tb.addSeparator()
+        tb.addAction(self._act("Поиск", self.open_search, "Ctrl+F"))
+        tb.addAction(self._act("Сравнить панели", self.open_compare, "Ctrl+Alt+C"))
+        tb.addAction(self._act("Пакетное переименование", self.open_batch_rename, "Ctrl+R"))
+        tb.addAction(self._act("Массовые атрибуты", self.open_attrs, "Ctrl+Alt+A"))
+        tb.addSeparator()
+        tb.addAction(self._act("Создать папку", self.create_folder, "F7"))
+        tb.addAction(self._act("Создать файл", self.create_file, "F8"))
 
-        act_search = QAction("Поиск", self)
-        act_search.setShortcut(QKeySequence("Ctrl+F"))
-        act_search.triggered.connect(self.open_search)
-        tb.addAction(act_search)
-
-        # ===== Hotkeys via Actions =====
+        # ===== Hotkeys =====
         self._setup_hotkeys()
 
-        # ===== Status bar =====
+        # ===== Status =====
         self.status = QStatusBar()
         self.setStatusBar(self.status)
 
-        # start dir
-        self.set_current_dir(Path.home())
-        self.file_view.selectionModel().selectionChanged.connect(self.update_status)
+        # Start dirs
+        self.set_panel_dir(self.left, Path.home())
+        self.set_panel_dir(self.right, Path.home())
+        self.set_active("L")
+        self.update_status()
 
-    # ===================== Hotkeys =====================
+    # -------------------- Event Filter (focus) --------------------
+    def go_back(self, panel: FilePanel):
+        if panel.history_index > 0:
+            panel.history_index -= 1
+            self.set_panel_dir(panel, panel.history[panel.history_index], push_history=False)
 
-    def _setup_hotkeys(self):
-        # Copy
-        a_copy = QAction(self)
-        a_copy.setShortcut(QKeySequence.Copy)
-        a_copy.triggered.connect(self.copy_selected)
-        self.addAction(a_copy)
+    def go_forward(self, panel: FilePanel):
+        if panel.history_index < len(panel.history) - 1:
+            panel.history_index += 1
+            self.set_panel_dir(panel, panel.history[panel.history_index], push_history=False)
 
-        # Cut
-        a_cut = QAction(self)
-        a_cut.setShortcut(QKeySequence.Cut)
-        a_cut.triggered.connect(self.cut_selected)
-        self.addAction(a_cut)
+    def go_up(self, panel: FilePanel):
+        cur = panel.root
+        parent = cur.parent
+        if parent != cur:
+            self.set_panel_dir(panel, parent)
 
-        # Paste
-        a_paste = QAction(self)
-        a_paste.setShortcut(QKeySequence.Paste)
-        a_paste.triggered.connect(lambda: self.paste_item(self.paste_target_dir()))
-        self.addAction(a_paste)
 
-        # Delete
-        a_del = QAction(self)
-        a_del.setShortcut(QKeySequence.Delete)
-        a_del.triggered.connect(self.delete_selected)
-        self.addAction(a_del)
+    def eventFilter(self, obj, event):
+        # если пользователь перемещается клавиатурой/Tab/кликает — ловим фокус
+        if event.type() == QEvent.FocusIn:
+            if obj is self.left.view:
+                self.set_active("L")
+            elif obj is self.right.view:
+                self.set_active("R")
+        return super().eventFilter(obj, event)
 
-        # Rename (F2)
-        a_rename = QAction(self)
-        a_rename.setShortcut(QKeySequence(Qt.Key_F2))
-        a_rename.triggered.connect(self.rename_selected)
-        self.addAction(a_rename)
+    # ===================== UTILS =====================
 
-        # Properties (Alt+Enter)
-        a_props = QAction(self)
-        a_props.setShortcut(QKeySequence("Alt+Return"))
-        a_props.triggered.connect(self.show_properties_selected)
-        self.addAction(a_props)
+    def _act(self, text, fn, shortcut=None):
+        a = QAction(text, self)
+        if shortcut:
+            a.setShortcut(QKeySequence(shortcut))
+        a.triggered.connect(fn)
+        return a
 
-    # ===================== Navigation =====================
+    def set_active(self, which: str):
+        self.active = which
+        self.status.showMessage(f"Активная панель: {'левая' if which=='L' else 'правая'}", 1000)
 
-    def paste_target_dir(self) -> Path:
-        """
-        Вычисляет папку-назначение для Ctrl+V:
-        - если выделена папка -> вставляем в неё
-        - если выделен файл -> вставляем в его родителя
-        - если ничего не выделено -> вставляем в текущую папку
-        """
-        p = self.selected_path()
-        if p and p.exists():
-            return p if p.is_dir() else p.parent
-        return self.current_dir()
+    def active_panel(self) -> FilePanel:
+        return self.left if self.active == "L" else self.right
 
-    def set_current_dir(self, path: Path, push_history: bool = True):
+    def passive_panel(self) -> FilePanel:
+        return self.right if self.active == "L" else self.left
+
+    def update_panel_nav_buttons(self, panel: FilePanel):
+        panel.btn_back.setEnabled(panel.history_index > 0)
+        panel.btn_forward.setEnabled(panel.history_index < len(panel.history) - 1)
+
+    def set_panel_dir(self, panel: FilePanel, path: Path, push_history: bool = True):
         path = path.expanduser().resolve()
         if not path.exists() or not path.is_dir():
             self.show_error(f"Папка не существует: {path}")
             return
 
         if push_history:
-            if self.history_index < len(self.history) - 1:
-                self.history = self.history[: self.history_index + 1]
-            self.history.append(path)
-            self.history_index += 1
+            # если мы “откатились назад” и идём в новую папку — обрезаем хвост
+            if panel.history_index < len(panel.history) - 1:
+                panel.history = panel.history[: panel.history_index + 1]
+            panel.history.append(path)
+            panel.history_index += 1
 
-        self.path_edit.setText(str(path))
+        panel.root = path
+        panel.path_edit.setText(str(path))
+        idx = panel.model.index(str(path))
+        if idx.isValid():
+            panel.view.setRootIndex(idx)
 
-        # right panel root
-        root_index = self.file_model.index(str(path))
-        if root_index.isValid():
-            self.file_view.setRootIndex(root_index)
-
-        # left panel highlight
-        d_idx = self.dir_model.index(str(path))
-        if d_idx.isValid():
-            self.dir_tree.setCurrentIndex(d_idx)
-            self.dir_tree.scrollTo(d_idx)
-
-        self.update_nav_buttons()
+        self.update_panel_nav_buttons(panel)
         self.update_status()
-        logger.info("CD | %s", path)
 
-    def current_dir(self) -> Path:
-        return Path(self.path_edit.text()).expanduser().resolve()
+    def go_to_path(self, panel: FilePanel):
+        self.set_panel_dir(panel, Path(panel.path_edit.text()))
 
-    def update_nav_buttons(self):
-        self.btn_back.setEnabled(self.history_index > 0)
-        self.btn_forward.setEnabled(self.history_index < len(self.history) - 1)
+    # ===================== SELECTION =====================
 
-    def go_to_path(self):
-        self.set_current_dir(Path(self.path_edit.text()))
+    def selected_paths(self, panel: FilePanel) -> List[Path]:
+        sel = panel.view.selectionModel().selectedRows(0)
+        return [Path(panel.model.filePath(i)) for i in sel]
 
-    def go_back(self):
-        if self.history_index > 0:
-            self.history_index -= 1
-            self.set_current_dir(self.history[self.history_index], push_history=False)
-
-    def go_forward(self):
-        if self.history_index < len(self.history) - 1:
-            self.history_index += 1
-            self.set_current_dir(self.history[self.history_index], push_history=False)
-
-    def go_up(self):
-        d = self.current_dir()
-        parent = d.parent
-        if parent != d:
-            self.set_current_dir(parent)
-
-    def refresh(self):
-        self.set_current_dir(self.current_dir(), push_history=False)
-
-    # ===================== Left panel =====================
-
-    def on_dir_clicked(self, index: QModelIndex):
-        path = Path(self.dir_model.filePath(index))
-        if path.exists() and path.is_dir():
-            self.set_current_dir(path)
-
-    # ===================== Right panel actions =====================
-
-    def selected_path(self) -> Optional[Path]:
-        idx = self.file_view.currentIndex()
+    def current_item(self, panel: FilePanel) -> Optional[Path]:
+        idx = panel.view.currentIndex()
         if not idx.isValid():
             return None
-        return Path(self.file_model.filePath(idx))
+        return Path(panel.model.filePath(idx))
 
-    def on_file_double_click(self, index: QModelIndex):
-        path = Path(self.file_model.filePath(index))
-        if path.is_dir():
-            self.set_current_dir(path)
+    def paste_target_dir(self, panel: FilePanel) -> Path:
+        # Ctrl+V / вставка: если выделена папка — в неё, иначе в корень панели
+        p = self.current_item(panel)
+        if p and p.exists():
+            return p if p.is_dir() else p.parent
+        return panel.root
+
+    # ===================== DOUBLE CLICK =====================
+
+    def on_double_click(self, panel: FilePanel, index: QModelIndex):
+        p = Path(panel.model.filePath(index))
+
+        if is_locked(p):
+            self.show_error(f"Объект заблокирован: {p.name}")
+            return
+
+        if p.is_dir():
+            self.set_panel_dir(panel, p)
         else:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(p)))
 
-    def open_context_menu(self, pos):
-        index = self.file_view.indexAt(pos)
-        menu = QMenu(self)
+    # ===================== HOTKEYS =====================
 
-        target_path: Optional[Path] = None
-        if index.isValid():
-            target_path = Path(self.file_model.filePath(index))
+    def _setup_hotkeys(self):
+        self.addAction(self._hk(QKeySequence.Copy, self.copy_selected))
+        self.addAction(self._hk(QKeySequence.Cut, self.cut_selected))
+        self.addAction(self._hk(QKeySequence.Paste, self.paste_hotkey))
+        self.addAction(self._hk(QKeySequence.Delete, self.delete_selected))
 
-        if target_path:
-            menu.addAction(self._mk_action("Открыть", lambda: self.open_item(target_path)))
-            menu.addSeparator()
-            menu.addAction(self._mk_action("Копировать", lambda: self.copy_item(target_path)))
-            menu.addAction(self._mk_action("Вырезать", lambda: self.cut_item(target_path)))
-            dst_dir = target_path if target_path.is_dir() else target_path.parent
-            menu.addAction(
-                self._mk_action(
-                    "Вставить",
-                    lambda: self.paste_item(dst_dir),
-                    enabled=self.clipboard.src is not None,
-                )
-            )
-            menu.addSeparator()
-            menu.addAction(self._mk_action("Переименовать", lambda: self.rename_item(target_path)))
-            menu.addAction(self._mk_action("Удалить", lambda: self.delete_item(target_path)))
-            menu.addSeparator()
-            menu.addAction(self._mk_action("Свойства", lambda: self.show_properties(target_path)))
+        a_rename = QAction(self)
+        a_rename.setShortcut(QKeySequence(Qt.Key_F2))
+        a_rename.triggered.connect(self.rename_selected)
+        self.addAction(a_rename)
 
-        else:
-            menu.addAction(
-                self._mk_action(
-                    "Вставить",
-                    lambda: self.paste_item(self.current_dir()),
-                    enabled=self.clipboard.src is not None,
-                )
-            )
-
-        menu.addSeparator()
-        menu.addAction(self._mk_action("Создать папку", self.create_folder))
-        menu.addAction(self._mk_action("Создать файл", self.create_file))
-        menu.exec(self.file_view.viewport().mapToGlobal(pos))
-
-    def _mk_action(self, text, fn, enabled=True):
-        a = QAction(text, self)
-        a.setEnabled(enabled)
+    def _hk(self, seq, fn):
+        a = QAction(self)
+        a.setShortcut(seq)
         a.triggered.connect(fn)
         return a
 
-    def open_item(self, path: Path):
-        if path.is_dir():
-            self.set_current_dir(path)
-        else:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
-
-    # ===== Clipboard operations =====
-
-    def copy_item(self, path: Path):
-        self.clipboard = Clipboard(src=path, is_cut=False)
-        self.status.showMessage(f"Буфер: копировать {path.name}", 2000)
-        logger.info("CLIPBOARD | COPY | %s", path)
-
-    def cut_item(self, path: Path):
-        self.clipboard = Clipboard(src=path, is_cut=True)
-        self.status.showMessage(f"Буфер: переместить {path.name}", 2000)
-        logger.info("CLIPBOARD | CUT | %s", path)
+    # ===================== CLIPBOARD =====================
 
     def copy_selected(self):
-        p = self.selected_path()
-        if p:
-            self.copy_item(p)
+        panel = self.active_panel()
+        items = self.selected_paths(panel)
+        if not items:
+            return
+
+        p = items[0]
+        if is_locked(p):
+            self.show_error(f"Объект заблокирован: {p.name}")
+            return
+
+        self.clipboard = Clipboard(src=p, is_cut=False)
+        logger.info("CLIPBOARD | COPY | %s", p)
 
     def cut_selected(self):
-        p = self.selected_path()
-        if p:
-            self.cut_item(p)
+        panel = self.active_panel()
+        items = self.selected_paths(panel)
+        if not items:
+            return
+
+        p = items[0]
+        if is_locked(p):
+            self.show_error(f"Объект заблокирован: {p.name}")
+            return
+
+        self.clipboard = Clipboard(src=p, is_cut=True)
+        logger.info("CLIPBOARD | CUT | %s", p)
+
+    def paste_hotkey(self):
+        panel = self.active_panel()
+        dst_dir = self.paste_target_dir(panel)
+        self.paste_item(dst_dir)
+
+    def paste_item(self, dst_dir: Path):
+        if not self.clipboard.src:
+            return
+
+        src = self.clipboard.src
+
+        # 1️⃣ Проверка: источник заблокирован?
+        if is_locked(src):
+            self.show_error(f"Объект заблокирован: {src.name}")
+            return
+
+        dst_dir = dst_dir.expanduser().resolve()
+
+        # 2️⃣ Проверка: нельзя вставлять в заблокированную папку
+        if is_locked(dst_dir):
+            self.show_error(f"Нельзя вставить в заблокированную папку: {dst_dir.name}")
+            return
+
+        dst = dst_dir / src.name
+
+        try:
+            if src.is_dir():
+                # ===== Вставка папки =====
+                if dst.exists() and dst.is_dir():
+                    if not self.confirm_merge_dirs(dst.name):
+                        return
+
+                    logger.info("MERGE_DIR | %s -> %s", src, dst)
+                    merge_copy_dir(src, dst)
+
+                    if self.clipboard.is_cut:
+                        remove_any(src)
+
+                else:
+                    if dst.exists() and dst.is_file():
+                        dst = unique_dir_path(dst)
+
+                    if self.clipboard.is_cut:
+                        move_any(src, dst)
+                    else:
+                        copy_any(src, dst)
+
+            else:
+                # ===== Вставка файла =====
+                if dst.exists():
+                    dst = unique_file_path(dst)
+
+                if self.clipboard.is_cut:
+                    move_any(src, dst)
+                else:
+                    copy_any(src, dst)
+
+        except Exception as e:
+            self.show_error(f"Ошибка вставки: {e}")
+            return
+
+        self.clipboard = Clipboard()
+        self.refresh_panels()
+
+    # ===================== CREATE / RENAME / DELETE =====================
+
+    def create_folder(self):
+        panel = self.active_panel()
+        base_dir = self.paste_target_dir(panel)
+
+        name, ok = QInputDialog.getText(self, "Создать папку", "Имя папки:", text="NewFolder")
+        if not ok or not name.strip():
+            return
+
+        folder = base_dir / name.strip()
+        if folder.exists():
+            folder = unique_dir_path(folder)
+
+        try:
+            logger.info("MKDIR | %s", folder)
+            folder.mkdir(parents=False)
+            self.refresh_panels()
+        except Exception as e:
+            self.show_error(f"Ошибка создания папки: {e}")
 
     def create_file(self):
+        panel = self.active_panel()
+        base_dir = self.paste_target_dir(panel)
+
         name, ok = QInputDialog.getText(
             self,
             "Создать файл",
@@ -359,229 +430,224 @@ class FileManagerWindow(QMainWindow):
         if not ok or not name.strip():
             return
 
-        file_path = self.current_dir() / name.strip()
-
-        # авто-нумерация именно для файла (важно: даже если существует папка с таким именем)
-        if file_path.exists():
-            file_path = unique_file_path(file_path)
+        p = base_dir / name.strip()
+        if p.exists():
+            p = unique_file_path(p)
 
         try:
-            logger.info("CREATE_FILE | %s", file_path)
-            create_file(file_path)
-            self.refresh()
+            logger.info("CREATE_FILE | %s", p)
+            core_create_file(p)
+            self.refresh_panels()
         except Exception as e:
             self.show_error(f"Ошибка создания файла: {e}")
 
-    def paste_item(self, dst_dir: Optional[Path] = None):
-        if not self.clipboard.src:
+    def rename_selected(self):
+        panel = self.active_panel()
+        p = self.current_item(panel)
+        if not p:
             return
 
-        src = self.clipboard.src
-        dst_dir = (dst_dir or self.current_dir()).expanduser().resolve()
-        dst = dst_dir / src.name
-
-        try:
-            if src.is_dir():
-                # ===== Вставляем ПАПКУ =====
-                if dst.exists():
-                    if dst.is_dir():
-                        # merge папок
-                        if not self.confirm_merge_dirs(dst.name):
-                            return
-
-                        logger.info("MERGE_DIR | %s -> %s", src, dst)
-                        merge_copy_dir(src, dst)
-
-                        if self.clipboard.is_cut:
-                            remove_any(src)
-                            self.clipboard = Clipboard()
-                    else:
-                        # конфликт: в месте папки уже есть ФАЙЛ => даём папке новое имя
-                        dst2 = unique_dir_path(dst)
-                        logger.info("DIR_CONFLICT_WITH_FILE | %s -> %s", src, dst2)
-
-                        if self.clipboard.is_cut:
-                            move_any(src, dst2)
-                            self.clipboard = Clipboard()
-                        else:
-                            copy_any(src, dst2)
-                else:
-                    # dst свободен
-                    if self.clipboard.is_cut:
-                        move_any(src, dst)
-                        self.clipboard = Clipboard()
-                    else:
-                        copy_any(src, dst)
-
-            else:
-                # ===== Вставляем ФАЙЛ =====
-                if dst.exists():
-                    if dst.is_dir():
-                        # конфликт: в месте файла уже есть ПАПКА => даём файлу новое имя
-                        dst2 = unique_file_path(dst)  # dst = ".../new_file.txt" (папка), получим ".../new_file (1).txt"
-                        logger.info("FILE_CONFLICT_WITH_DIR | %s -> %s", src, dst2)
-                    else:
-                        # конфликт: файл-файл => keep both
-                        dst2 = unique_file_path(dst)
-                        logger.info("FILE_CONFLICT_WITH_FILE | %s -> %s", src, dst2)
-                else:
-                    dst2 = dst
-
-                if self.clipboard.is_cut:
-                    move_any(src, dst2)
-                    self.clipboard = Clipboard()
-                else:
-                    copy_any(src, dst2)
-
-        except Exception as e:
-            self.show_error(f"Ошибка вставки: {e}")
+        if is_locked(p):
+            self.show_error(f"Объект заблокирован: {p.name}")
             return
 
-        self.refresh()
-        self.status.showMessage("Готово.", 1500)
-
-    # ===== Rename/Delete/Create =====
-
-    def rename_item(self, path: Path):
-        new_name, ok = QInputDialog.getText(self, "Переименовать", "Новое имя:", text=path.name)
+        new_name, ok = QInputDialog.getText(self, "Переименовать", "Новое имя:", text=p.name)
         if not ok or not new_name.strip():
             return
-        new_path = path.parent / new_name.strip()
+
+        new_path = p.parent / new_name.strip()
         if new_path.exists():
             self.show_error("Файл/папка с таким именем уже существует.")
             return
+
         try:
-            logger.info("RENAME | %s -> %s", path, new_path)
-            path.rename(new_path)
-            self.refresh()
+            logger.info("RENAME | %s -> %s", p, new_path)
+            p.rename(new_path)
+            self.refresh_panels()
         except Exception as e:
             self.show_error(f"Ошибка переименования: {e}")
 
-    def rename_selected(self):
-        p = self.selected_path()
-        if p:
-            self.rename_item(p)
-
-    def delete_item(self, path: Path):
-        res = QMessageBox.question(
-            self,
-            "Удаление",
-            f"Удалить '{path.name}'?",
-            QMessageBox.Yes | QMessageBox.No,
-        )
-        if res != QMessageBox.Yes:
+    def delete_selected(self):
+        panel = self.active_panel()
+        items = self.selected_paths(panel)
+        if not items:
             return
+
+        locked = [x for x in items if is_locked(x)]
+        if locked:
+            self.show_error("Есть заблокированные объекты:\n" + "\n".join(f"• {x.name}" for x in locked))
+            return
+
+        if QMessageBox.question(
+                self,
+                "Удаление",
+                f"Удалить выбранные объекты ({len(items)})?",
+                QMessageBox.Yes | QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
+
         try:
-            remove_any(path)
-            self.refresh()
+            for x in items:
+                remove_any(x)
+            self.refresh_panels()
         except Exception as e:
             self.show_error(f"Ошибка удаления: {e}")
 
-    def delete_selected(self):
-        p = self.selected_path()
-        if p:
-            self.delete_item(p)
+    # ===================== CONTEXT MENU =====================
 
-    def create_folder(self):
-        name, ok = QInputDialog.getText(self, "Создать папку", "Имя папки:", text="NewFolder")
-        if not ok or not name.strip():
+    def open_context_menu(self, panel: FilePanel, pos):
+        self.set_active("L" if panel is self.left else "R")  # важно: меню делает панель активной
+
+        menu = QMenu(self)
+        idx = panel.view.indexAt(pos)
+        target = Path(panel.model.filePath(idx)) if idx.isValid() else None
+
+        # вставка всегда в "правильную" цель
+        paste_dir = (target if (target and target.is_dir()) else (target.parent if target else panel.root))
+
+        if target:
+            menu.addAction(self._mk_action("Открыть", lambda: self.open_item(target)))
+            menu.addSeparator()
+            menu.addAction(self._mk_action("Копировать", self.copy_selected))
+            menu.addAction(self._mk_action("Вырезать", self.cut_selected))
+            menu.addAction(self._mk_action("Вставить", lambda: self.paste_item(paste_dir), enabled=self.clipboard.src is not None))
+            menu.addSeparator()
+            menu.addAction(self._mk_action("Переименовать", self.rename_selected))
+            menu.addAction(self._mk_action("Удалить", self.delete_selected))
+            menu.addSeparator()
+            menu.addAction(self._mk_action("Свойства", lambda: self.show_properties(target)))
+        else:
+            menu.addAction(self._mk_action("Вставить", lambda: self.paste_item(panel.root), enabled=self.clipboard.src is not None))
+
+        menu.addSeparator()
+        menu.addAction(self._mk_action("Создать папку", self.create_folder))
+        menu.addAction(self._mk_action("Создать файл", self.create_file))
+
+        menu.addSeparator()
+        menu.addAction(self._mk_action("Поиск…", self.open_search))
+        menu.addAction(self._mk_action("Сравнить панели…", self.open_compare))
+        menu.addAction(self._mk_action("Пакетное переименование…", self.open_batch_rename))
+        menu.addAction(self._mk_action("Массовые атрибуты…", self.open_attrs))
+
+        menu.exec(panel.view.viewport().mapToGlobal(pos))
+
+    def _mk_action(self, text, fn, enabled=True):
+        a = QAction(text, self)
+        a.setEnabled(enabled)
+        a.triggered.connect(fn)
+        return a
+
+    def open_item(self, p: Path):
+        if is_locked(p):
+            self.show_error(f"Объект заблокирован: {p.name}")
             return
+        if p.is_dir():
+            self.set_panel_dir(self.active_panel(), p)
+        else:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(p)))
 
-        folder = self.current_dir() / name.strip()
-
-        # авто-нумерация именно для папки
-        if folder.exists():
-            folder = unique_dir_path(folder)
-
-        try:
-            logger.info("MKDIR | %s", folder)
-            folder.mkdir(parents=False)
-            self.refresh()
-        except Exception as e:
-            self.show_error(f"Ошибка создания папки: {e}")
-
-    def show_properties(self, path: Path):
-        dlg = PropertiesDialog(path, self)
+    def show_properties(self, p: Path):
+        dlg = PropertiesDialog(p, self)
         dlg.exec()
 
-    def show_properties_selected(self):
-        p = self.selected_path()
-        if p:
-            self.show_properties(p)
-
-    # ===== Search =====
+    # ===================== TOOLS: SEARCH / COMPARE / BATCH / ATTRS =====================
 
     def open_search(self):
-        dlg = SearchDialog(self.current_dir(), self)
-        res = dlg.exec()
-        if res:  # accept
+        # ВАЖНО: поиск запускается из АКТИВНОЙ панели
+        panel = self.active_panel()
+        dlg = SearchDialog(panel.root, self)
+        if dlg.exec():
             p = dlg.get_selected()
             if p:
-                # если файл — перейдём в папку
-                target_dir = p if p.is_dir() else p.parent
-                self.set_current_dir(target_dir)
+                self.set_panel_dir(panel, p if p.is_dir() else p.parent)
 
-    # ===================== Status =====================
+    def open_compare(self):
+        # сравнение всегда: левая vs правая (как в двухпанельниках)
+        dlg = CompareDialog(self.left.root, self)
+        dlg.right_root = self.right.root
+        dlg.right_edit.setText(str(self.right.root))
+        dlg.run_compare()
+        dlg.exec()
 
-    def update_status(self, *_):
-        # статус текущей папки: количество объектов
-        try:
-            root = self.current_dir()
-            count = 0
-            for _ in root.iterdir():
-                count += 1
-            msg = f"{root} | объектов: {count}"
-        except Exception:
-            msg = str(self.current_dir())
+    def open_batch_rename(self):
+        panel = self.active_panel()
+        items = self.selected_paths(panel)
+        if not items:
+            self.show_error("Ничего не выбрано.")
+            return
 
-        sel = self.selected_path()
-        if sel and sel.exists():
-            if sel.is_file():
-                try:
-                    msg += f" | выделено: {sel.name} ({sel.stat().st_size} B)"
-                except Exception:
-                    msg += f" | выделено: {sel.name}"
+        dlg = BatchRenameDialog(items, self)
+        if dlg.exec():
+            plan = dlg.get_plan()
+            if not plan:
+                self.show_error("Сначала нажми «Предпросмотр», чтобы сформировать план.")
+                return
+            try:
+                for it in plan:
+                    it.src.rename(it.dst)
+                self.refresh_panels()
+            except Exception as e:
+                self.show_error(f"Ошибка переименования: {e}")
+
+    def open_attrs(self):
+        panel = self.active_panel()
+
+        items = self.selected_paths(panel)
+        if not items:
+            cur = self.current_item(panel)
+            if cur:
+                items = [cur]
             else:
-                msg += f" | выделено: {sel.name} (папка)"
-        self.status.showMessage(msg)
+                self.show_error("Ничего не выбрано.")
+                return
 
-    def show_error(self, message: str):
-        logger.error("ERROR | %s", message)
-        QMessageBox.critical(self, "Ошибка", message)
+        dlg = AttrsDialog(items, self)
+        if dlg.exec():
+            try:
+                apply_attrs(items, dlg.get_request())
+                self.refresh_panels()
+            except Exception as e:
+                self.show_error(f"Ошибка изменения атрибутов: {e}")
 
-    def confirm_merge_dirs(self, folder_name: str) -> bool:
-        """
-        Диалог подтверждения слияния папок.
-        Возвращает True, если пользователь согласился.
-        """
+    # ===================== REFRESH / STATUS =====================
+
+    def refresh_panels(self):
+        self.set_panel_dir(self.left, self.left.root)
+        self.set_panel_dir(self.right, self.right.root)
+
+    def update_status(self):
+        try:
+            l_count = sum(1 for _ in self.left.root.iterdir())
+        except Exception:
+            l_count = -1
+        try:
+            r_count = sum(1 for _ in self.right.root.iterdir())
+        except Exception:
+            r_count = -1
+
+        self.status.showMessage(
+            f"Левая: {self.left.root} (объектов: {l_count}) | "
+            f"Правая: {self.right.root} (объектов: {r_count}) | "
+            f"Активная: {'левая' if self.active=='L' else 'правая'}"
+        )
+
+    # ===================== MISC =====================
+
+    def show_error(self, msg: str):
+        logger.error("ERROR | %s", msg)
+        QMessageBox.critical(self, "Ошибка", msg)
+
+    def confirm_merge_dirs(self, name: str) -> bool:
         msg = QMessageBox(self)
         msg.setIcon(QMessageBox.Warning)
         msg.setWindowTitle("Слияние папок")
         msg.setText(
-            f'В целевой папке уже существует каталог "{folder_name}".\n\n'
-            "При нажатии «OK» содержимое папок будет объединено.\n"
-            "Файлы с одинаковыми именами будут сохранены в обоих вариантах "
-            "с автоматическим добавлением номера.\n\n"
+            f'В целевой папке уже существует каталог "{name}".\n\n'
+            "При нажатии «OK» содержимое будет объединено.\n"
+            "При конфликтах имён файлы будут сохранены с нумерацией.\n\n"
             "Продолжить?"
         )
-
-        btn_ok = msg.addButton("OK", QMessageBox.AcceptRole)
-        btn_cancel = msg.addButton("Отмена", QMessageBox.RejectRole)
-        btn_help = msg.addButton("Справка", QMessageBox.HelpRole)
-
+        ok = msg.addButton("OK", QMessageBox.AcceptRole)
+        msg.addButton("Отмена", QMessageBox.RejectRole)
         msg.exec()
-
-        if msg.clickedButton() == btn_help:
-            QMessageBox.information(
-                self,
-                "Справка",
-                "Слияние папок объединяет содержимое каталогов.\n\n"
-                "• Существующие файлы не удаляются\n"
-                "• При совпадении имён создаётся копия с номером\n"
-                "• Операция необратима",
-            )
-            # после справки снова спрашиваем
-            return self.confirm_merge_dirs(folder_name)
-
-        return msg.clickedButton() == btn_ok
-
+        return msg.clickedButton() == ok

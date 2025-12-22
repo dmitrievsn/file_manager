@@ -33,15 +33,12 @@ class SearchDialog(QDialog):
         self.start_dir = start_dir
         self.selected_path: Optional[Path] = None
 
-        # ===== Поле ввода =====
         self.query_edit = QLineEdit()
         self.query_edit.setPlaceholderText("Введите часть имени файла или папки")
 
-        # ===== Рекурсивный поиск =====
         self.recursive_cb = QCheckBox("Искать в подпапках")
         self.recursive_cb.setChecked(True)
 
-        # ===== Кнопка поиска =====
         self.btn_search = QPushButton("Найти")
         self.btn_search.clicked.connect(self.do_search)
 
@@ -50,15 +47,12 @@ class SearchDialog(QDialog):
         top.addWidget(self.query_edit, 1)
         top.addWidget(self.btn_search)
 
-        # ===== Список результатов =====
         self.listw = QListWidget()
         self.listw.itemDoubleClicked.connect(self.open_item)
         self.listw.currentItemChanged.connect(self.on_select)
 
-        # ===== Информация =====
         self.info = QLabel("")
 
-        # ===== Кнопки =====
         self.btn_open = QPushButton("Открыть")
         self.btn_open.setEnabled(False)
         self.btn_open.clicked.connect(self.open_selected)
@@ -76,15 +70,12 @@ class SearchDialog(QDialog):
         bottom.addStretch(1)
         bottom.addWidget(self.btn_close)
 
-        # ===== Основная компоновка =====
         layout = QVBoxLayout(self)
         layout.addLayout(top)
         layout.addWidget(self.recursive_cb)
         layout.addWidget(self.listw, 1)
         layout.addWidget(self.info)
         layout.addLayout(bottom)
-
-    # ===================== Логика =====================
 
     def do_search(self):
         """Запуск поиска."""
